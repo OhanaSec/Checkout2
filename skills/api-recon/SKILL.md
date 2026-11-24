@@ -302,6 +302,8 @@ cd recon && npm install
 node runtime_harvest.js config.json
 ```
 
+TLS certificate verification stays on. When routing through an intercepting proxy, trust its CA (`NODE_EXTRA_CA_CERTS` for Node, the system/NSS store for Chromium). `"insecureTls": true` / `API_RECON_INSECURE_TLS=1` is an explicit, unauthenticated-only opt-out: it is refused when `cookies` are configured and strips `Cookie`/`Authorization` from forwarded requests.
+
 ### 3b: coverage dynamic enumeration (required)
 
 1. Main navigation/sidebar: click each item, wait 1–3 seconds for network
