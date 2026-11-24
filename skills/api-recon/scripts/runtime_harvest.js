@@ -29,16 +29,46 @@
  *   "proxy": "http://127.0.0.1:8080",           // optional; also HTTP_PROXY / HTTPS_PROXY
  *   "waitUntil": "domcontentloaded",            // prefer over networkidle2 for large SPAs
  *   "routeTimeout": 12000,
- *   "waitMs": 1200, "perRouteMs": 900, "headless": true
+ *   "waitMs": 1200, "perRouteMs": 900, "headless": true,
+ *   "insecureTls": false                        // see TLS note below; never combine with cookies
  * }
+ *
+ * TLS: certificate verification is ON by default for both Node fetch and Chromium.
+ * To route through an intercepting proxy, trust its CA instead (NODE_EXTRA_CA_CERTS for
+ * Node, system/NSS trust store for Chromium). Disabling verification is an explicit opt-in
+ * ("insecureTls": true or env API_RECON_INSECURE_TLS=1) and is REFUSED when auth cookies are
+ * configured; in that mode Cookie/Authorization headers are also stripped from forwarded
+ * requests so session credentials are never sent over an unverified connection.
  */
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const fs = require('fs');
 const path = require('path');
 
-let puppeteer;
-try { puppeteer = require('puppeteer-core'); }
-catch (e) { console.error("[!] run `npm install` in the scripts/ dir first (needs puppeteer-core)"); process.exit(1); }
+const SENSITIVE_HEADERS = ['cookie', 'authorization', 'proxy-authorization'];
+
+function resolveTlsPolicy(cfg, env) {
+  env = env || {};
+  const insecure = cfg.insecureTls === true || env.API_RECON_INSECURE_TLS === '1';
+  const hasCookies = Array.isArray(cfg.cookies) ? cfg.cookies.length > 0 : !!cfg.cookies;
+  if (insecure && hasCookies) {
+    throw new Error('refusing to run: insecureTls (TLS verification disabled) cannot be combined with ' +
+      'auth cookies; trust the proxy CA via NODE_EXTRA_CA_CERTS instead');
+  }
+  return {
+    insecure,
+    launchArgs: insecure ? ['--ignore-certificate-errors'] : [],
+    stripHeaders: insecure ? SENSITIVE_HEADERS.slice() : []
+  };
+}
+
+function forwardHeaders(reqHeaders, cfg, policy) {
+  const headers = Object.assign({}, reqHeaders);
+  if (policy.insecure) {
+    for (const k of Object.keys(headers)) if (policy.stripHeaders.includes(k.toLowerCase())) delete headers[k];
+    return headers;
+  }
+  if (cfg.cookies) headers.cookie = cfg.cookies.map(c => `${c.name}=${cookieValue(c.value)}`).join('; ');
+  return headers;
+}
 
 function loadCfg(p) {
   const c = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -81,8 +111,19 @@ function neutralize(txt, n) {
   return txt;
 }
 
-(async () => {
+async function main() {
+  let puppeteer;
+  try { puppeteer = require('puppeteer-core'); }
+  catch (e) { console.error("[!] run `npm install` in the scripts/ dir first (needs puppeteer-core)"); process.exit(1); }
+
   const cfg = loadCfg(process.argv[2] || 'config.json');
+  let tls;
+  try { tls = resolveTlsPolicy(cfg, process.env); }
+  catch (e) { console.error('[!] ' + e.message); process.exit(2); }
+  if (tls.insecure) {
+    console.error('[!] WARNING: TLS certificate verification DISABLED (explicit opt-in); cookie/authorization headers will not be sent');
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  }
   const origin = new URL(cfg.baseUrl).origin;
   const host = new URL(cfg.baseUrl).hostname;
   const rec = [];           // {m,u,b,resp,ct}
@@ -94,7 +135,7 @@ function neutralize(txt, n) {
     process.env.HTTP_PROXY = cfg.proxy;
     process.env.HTTPS_PROXY = cfg.proxy;
   }
-  const launchArgs = ['--no-sandbox', '--disable-dev-shm-usage', '--ignore-certificate-errors'];
+  const launchArgs = ['--no-sandbox', '--disable-dev-shm-usage', ...tls.launchArgs];
   if (cfg.proxy) launchArgs.push(`--proxy-server=${cfg.proxy}`);
   const browser = await puppeteer.launch({
     executablePath: cfg.chromium, headless: cfg.headless ? 'new' : false,
@@ -167,8 +208,7 @@ function neutralize(txt, n) {
     }
     // forward real request, then rewrite the unauthorized code field
     try {
-      const headers = Object.assign({}, req.headers());
-      if (cfg.cookies) headers.cookie = cfg.cookies.map(c => `${c.name}=${cookieValue(c.value)}`).join('; ');
+      const headers = forwardHeaders(req.headers(), cfg, tls);
       const r = await fetch(u, { method: m, headers, body: (m !== 'GET' && m !== 'HEAD') ? req.postData() : undefined });
       const t = await r.text();
       if (cfg.captureResponses) { entry.resp = t.slice(0, cfg.respMax); entry.ct = r.headers.get('content-type') || ''; }
@@ -225,4 +265,8 @@ function neutralize(txt, n) {
   console.log(`[+] merged unique paths: ${merged.size}  -> api_merged.txt`);
   console.log(`[+] full detail -> runtime_api.json (per-route + bodies + ws frames + sse)`);
   await browser.close();
-})();
+}
+
+if (require.main === module) main();
+
+module.exports = { resolveTlsPolicy, forwardHeaders, cookieValue, loadCfg };
